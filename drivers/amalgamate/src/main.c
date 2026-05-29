@@ -1,17 +1,22 @@
 #include <bake.h>
 #include <bake_amalgamate.h>
 
-BAKE_AMALGAMATE_API 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+BAKE_AMALGAMATE_API
 int bakemain(bake_driver_api *driver);
 
-// If longer, bad
-#define MAX_LINE_LENGTH (256) 
+#define MAX_LINE_LENGTH (4096)
+#define MAX_COND (256)
 
 static
 const char *skip_ws(
     const char *ptr)
 {
-    while (isspace(*ptr)) {
+    while (ptr && *ptr && isspace((unsigned char)*ptr)) {
         ptr ++;
     }
     return ptr;
@@ -19,9 +24,9 @@ const char *skip_ws(
 
 static
 int compare_string(
-    void *ctx, 
-    const void *f1, 
-    const void *f2) 
+    void *ctx,
+    const void *f1,
+    const void *f2)
 {
     return strcmp(f1, f2);
 }
@@ -37,54 +42,310 @@ char *combine_path(
     return ut_strbuf_get(&path_buf);
 }
 
-/* Get file from include statement */
+static
+bool is_ident_char(
+    char c)
+{
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+/* Get file from include statement. Returns NULL if line is not an #include. */
 static
 char* parse_include_file(
-    const char *line, 
-    bool *relative) 
+    const char *line,
+    bool *relative)
 {
-    const char *file_start = &line[7];
-    file_start = skip_ws(file_start);
+    *relative = false;
+
+    const char *p = skip_ws(line);
+    if (!p || p[0] != '#') {
+        return NULL;
+    }
+
+    p = skip_ws(p + 1);
+    if (strncmp(p, "include", 7)) {
+        return NULL;
+    }
+
+    p = skip_ws(p + 7);
+    if (!p || !p[0]) {
+        return NULL;
+    }
 
     char end = '>';
-    if (file_start[0] == '"') {
-        *relative = true;
+    if (p[0] == '"') {
         end = '"';
+        *relative = true;
+    } else if (p[0] != '<') {
+        return NULL;
     }
 
-    file_start ++;
-    char *file = ut_strdup(file_start);
-    char *file_end = strchr(file, end);
-    if (!file_end) {
-        ut_error("invalid include '%s'", line);
-        goto error;
+    p ++;
+    const char *end_ptr = strchr(p, end);
+    if (!end_ptr) {
+        return NULL;
     }
 
-    *file_end = '\0';
+    size_t len = (size_t)(end_ptr - p);
+    char *out = malloc(len + 1);
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return out;
+}
 
-    return file;
-error:
-    return NULL;
+/* -- Disable-flag (conditional compilation) handling -- */
+
+typedef enum cpp_directive_kind {
+    CPP_NONE,
+    CPP_IF,
+    CPP_IFDEF,
+    CPP_IFNDEF,
+    CPP_ELIF,
+    CPP_ELSE,
+    CPP_ENDIF
+} cpp_directive_kind;
+
+typedef struct cond_frame {
+    bool managed;
+    bool emit;
+    bool taken;
+} cond_frame;
+
+static
+cpp_directive_kind parse_cpp_directive(
+    const char *line,
+    const char **arg_out)
+{
+    *arg_out = NULL;
+
+    const char *p = skip_ws(line);
+    if (!p || p[0] != '#') {
+        return CPP_NONE;
+    }
+
+    p = skip_ws(p + 1);
+    const char *word = p;
+    while (is_ident_char(*p)) {
+        p ++;
+    }
+
+    size_t len = (size_t)(p - word);
+    cpp_directive_kind kind = CPP_NONE;
+    if (len == 2 && !strncmp(word, "if", 2)) {
+        kind = CPP_IF;
+    } else if (len == 5 && !strncmp(word, "ifdef", 5)) {
+        kind = CPP_IFDEF;
+    } else if (len == 6 && !strncmp(word, "ifndef", 6)) {
+        kind = CPP_IFNDEF;
+    } else if (len == 4 && !strncmp(word, "elif", 4)) {
+        kind = CPP_ELIF;
+    } else if (len == 4 && !strncmp(word, "else", 4)) {
+        kind = CPP_ELSE;
+    } else if (len == 5 && !strncmp(word, "endif", 5)) {
+        kind = CPP_ENDIF;
+    }
+
+    if (kind != CPP_NONE) {
+        *arg_out = p;
+    }
+    return kind;
+}
+
+static
+bool disable_contains(
+    ut_ll disable,
+    const char *name,
+    size_t len)
+{
+    if (!disable || !len) {
+        return false;
+    }
+    ut_iter it = ut_ll_iter(disable);
+    while (ut_iter_hasNext(&it)) {
+        const char *flag = ut_iter_next(&it);
+        if (!strncmp(flag, name, len) && !flag[len]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static
+bool arg_is_disabled_macro(
+    const char *arg,
+    ut_ll disable)
+{
+    const char *p = skip_ws(arg);
+    const char *name = p;
+    while (is_ident_char(*p)) {
+        p ++;
+    }
+    return disable_contains(disable, name, (size_t)(p - name));
+}
+
+static
+bool is_disabled_define(
+    const char *line,
+    ut_ll disable)
+{
+    const char *p = skip_ws(line);
+    if (p[0] != '#') {
+        return false;
+    }
+    p = skip_ws(p + 1);
+    if (strncmp(p, "define", 6) || is_ident_char(p[6])) {
+        return false;
+    }
+    p = skip_ws(p + 6);
+    const char *name = p;
+    while (is_ident_char(*p)) {
+        p ++;
+    }
+    if (p[0] == '(') {
+        return false;
+    }
+    return disable_contains(disable, name, (size_t)(p - name));
+}
+
+static
+bool eval_defined_expr(
+    const char *expr,
+    ut_ll disable,
+    bool *value_out)
+{
+    const char *p = skip_ws(expr);
+    bool negate = false;
+    if (p[0] == '!') {
+        negate = true;
+        p = skip_ws(p + 1);
+    }
+
+    if (strncmp(p, "defined", 7)) {
+        return false;
+    }
+    p += 7;
+
+    bool had_paren = false;
+    p = skip_ws(p);
+    if (p[0] == '(') {
+        had_paren = true;
+        p = skip_ws(p + 1);
+    } else if (!is_ident_char(p[0])) {
+        return false;
+    }
+
+    const char *name = p;
+    while (is_ident_char(*p)) {
+        p ++;
+    }
+    size_t name_len = (size_t)(p - name);
+
+    p = skip_ws(p);
+    if (had_paren) {
+        if (p[0] != ')') {
+            return false;
+        }
+        p = skip_ws(p + 1);
+    }
+
+    if (p[0] != '\0' && p[0] != '\n' && p[0] != '\r') {
+        return false;
+    }
+
+    if (!disable_contains(disable, name, name_len)) {
+        return false;
+    }
+
+    *value_out = negate ? true : false;
+    return true;
+}
+
+static
+char* condition_text(
+    const char *arg)
+{
+    const char *start = skip_ws(arg);
+    size_t len = strlen(start);
+    char *text = malloc(len + 1);
+    memcpy(text, start, len);
+    text[len] = '\0';
+
+    char *p;
+    for (p = text; *p; p ++) {
+        if (p[0] == '/' && (p[1] == '/' || p[1] == '*')) {
+            *p = '\0';
+            break;
+        }
+        if (p[0] == '\n' || p[0] == '\r') {
+            *p = '\0';
+            break;
+        }
+    }
+
+    char *end = text + strlen(text);
+    while (end > text && isspace((unsigned char)end[-1])) {
+        *(--end) = '\0';
+    }
+
+    return text;
+}
+
+static
+bool cond_eval_managed(
+    cpp_directive_kind kind,
+    const char *arg,
+    ut_ll disable,
+    bool *body_emit_out)
+{
+    if (kind == CPP_IFDEF) {
+        if (arg_is_disabled_macro(arg, disable)) {
+            *body_emit_out = false;
+            return true;
+        }
+        return false;
+    }
+
+    if (kind == CPP_IFNDEF) {
+        if (arg_is_disabled_macro(arg, disable)) {
+            *body_emit_out = true;
+            return true;
+        }
+        return false;
+    }
+
+    if (kind == CPP_IF) {
+        char *cond = condition_text(arg);
+        bool value = false;
+        bool managed = eval_defined_expr(cond, disable, &value);
+        free(cond);
+        if (managed) {
+            *body_emit_out = value;
+            return true;
+        }
+        return false;
+    }
+
+    return false;
 }
 
 /* Amalgamate source file */
 static
 int amalgamate(
-    const char *project_id,
-    FILE *out, 
+    const char *include_name,
+    FILE *out,
     const char *include_path,
     bool is_include,
     const char *const_file,
     const char *src_file,
     int32_t src_line,
     ut_rb files_parsed,
-    time_t *last_modified,
-    bool *main_included) 
+    ut_ll disable,
+    bool *main_included)
 {
     char *file = strreplace(const_file, "/", UT_OS_PS);
     ut_path_clean(file, file);
     if (ut_rb_find(files_parsed, file)) {
-        ut_debug("amalgamate: skip   '%s'  (from '%s:%d')", file, 
+        ut_debug("amalgamate: skip   '%s'  (from '%s:%d')", file,
             src_file, src_line);
         free(file);
         return 0;
@@ -105,127 +366,235 @@ int amalgamate(
         last_elem = cur_path;
     }
 
-    /* Check if current file is a bake_config.h. If it is, replace the <> 
+    /* Check if current file is a bake_config.h. If it is, replace the <>
      * includes it contains with "" */
     bool bake_config_h = !strcmp(last_elem, "bake_config.h");
 
     /* Buffer used for reading lines */
     char line[MAX_LINE_LENGTH];
-    int32_t line_count = 0;
 
     /* Open file for reading */
-    FILE* in = ut_file_open(file, "r");
+    FILE* in = fopen(file, "rb");
     if (!in) {
         ut_error("cannot read file '%s'", file);
         goto error;
     }
 
-    time_t modified = ut_lastmodified(file);
-    if (modified > last_modified[0]) {
-        last_modified[0] = modified;
-    }
+    int32_t line_count = 0;
+    bool in_block_comment = false;
+    bool has_disable = disable && ut_ll_count(disable) > 0;
+    cond_frame cond_stack[MAX_COND];
+    int32_t cond_depth = 0;
+    int32_t suppressed = 0;
 
-    while (ut_file_readln(in, line, MAX_LINE_LENGTH) != NULL) {
+    while (fgets(line, MAX_LINE_LENGTH, in) != NULL) {
         line_count ++;
 
-        if (line[0] == '#') {
-            const char *pp_start = skip_ws(line + 1);
+        /* Track whether the line starts inside a block comment, and update the
+         * comment state for the next line. This prevents #include and other
+         * directives inside comments from being processed. */
+        bool line_in_block_comment_at_start = in_block_comment;
+        const char *scan = line;
+        while (*scan) {
+            if (in_block_comment) {
+                if (scan[0] == '*' && scan[1] == '/') {
+                    in_block_comment = false;
+                    scan += 2;
+                    continue;
+                }
+                scan ++;
+                continue;
+            }
+            if (scan[0] == '/' && scan[1] == '*') {
+                in_block_comment = true;
+                scan += 2;
+                continue;
+            }
+            scan ++;
+        }
 
-            if (!strncmp(pp_start, "include", 7)) {
-                if (!is_include && !main_included[0]) {
-                    /* If this is the first include of the source file, add
-                     * include statement for main header */
-                    fprintf(out, "#include \"%s.h\"\n", project_id);
-                    main_included[0] = true;
+        /* Handle conditional directives for disabled flags */
+        if (has_disable && !line_in_block_comment_at_start) {
+            const char *arg = NULL;
+            cpp_directive_kind directive = parse_cpp_directive(line, &arg);
+
+            if (directive == CPP_IF ||
+                directive == CPP_IFDEF ||
+                directive == CPP_IFNDEF)
+            {
+                if (cond_depth >= MAX_COND) {
+                    ut_error("preprocessor nesting too deep in '%s'", file);
+                    goto error_close;
                 }
 
-                bool relative = false;
-                char *include = parse_include_file(pp_start, &relative);
+                bool body_emit = true;
+                bool managed = cond_eval_managed(
+                    directive, arg, disable, &body_emit);
 
-                if (!relative) {
-                    /* If this is in the bake_config.h file, replace the 
-                     * statement with one that uses "". Assume that the file
-                     * exists, as bake may still be generating it. */
-                    if (bake_config_h) {
-                        fprintf(out, "#include \"%s\"\n", include);
-                    } else {
-                        /* If this is an absolute path, this either refers to a
-                        * system include file or to a file in the include folder.
-                        * If we are amalgamating source files, we should include
-                        * neither. If we are amalgamating include files, we should
-                        * only include when the file is in our include folder */
-                        char *path = combine_path(include_path, include);
-                        if (ut_file_test(path) == 1) {                            
-                            /* Only amalgamate if file exists */
-                            ut_try(
-                                amalgamate(project_id, out, include_path, is_include, path, 
-                                    file, line_count, files_parsed, last_modified, main_included), 
-                                NULL);
-                        } else {
-                            /* If file cannot be found in project, include */
-                            fprintf(out, "%s", line);
-                        }
-                        free(path);
+                cond_frame *frame = &cond_stack[cond_depth ++];
+                frame->managed = managed;
+                if (managed) {
+                    frame->emit = body_emit;
+                    frame->taken = body_emit;
+                    if (!body_emit) {
+                        suppressed ++;
                     }
                 } else {
-                    /* If this is a relative path, we should always include it,
-                     * if the file can be found. System headers and headers from
-                     * the include path can be included with include "". If we
-                     * are generating the include file, we have to also try to
-                     * find the file in the include path. If we are generating
-                     * the source, we need to check if the file existst in the
-                     * source path, as if it doesn't, it is a system header we
-                     * need to include. */
-                    char *path = combine_path(cur_path, include);
-
-                    if (ut_file_test(path) != 1) {
-                        /* If we don't find the file in the relative path, look
-                         * for the file in the include path, but only if we are
-                         * generating the include file. */
-                        free(path);
-                        path = combine_path(include_path, include);
-                        if (ut_file_test(path) != 1) {
-                            /* If file cannot be found in project, include */
-                            fprintf(out, "%s", line);                           
-                            free(path);
-                            path = NULL;
-                        } else if (!is_include) {
-                            /* If we are not generating the include file, we
-                             * generally don't want to include files from the
-                             * include path. However, it is theoretically 
-                             * possible that a file was not included by the main
-                             * include file, but is by source files. In that
-                             * case it should be amalgamated in the source. This
-                             * will not result in duplicate code, as the header
-                             * will already have been flagged as included. */
-                        }
-                    }
-
-                    if (path) {
-                        /* Amalgamate this file */
-                        ut_try(
-                            amalgamate(project_id, out, include_path, is_include, path, 
-                                file, line_count, files_parsed, last_modified, main_included), 
-                                NULL);
-                        free(path);                        
+                    frame->emit = true;
+                    frame->taken = false;
+                    if (suppressed == 0) {
+                        fprintf(out, "%s", line);
                     }
                 }
+                continue;
+            }
 
-                free(include);
-                
+            if (directive == CPP_ELSE && cond_depth > 0) {
+                cond_frame *frame = &cond_stack[cond_depth - 1];
+                if (frame->managed) {
+                    if (frame->taken) {
+                        if (frame->emit) {
+                            frame->emit = false;
+                            suppressed ++;
+                        }
+                    } else {
+                        if (!frame->emit) {
+                            suppressed --;
+                        }
+                        frame->emit = true;
+                        frame->taken = true;
+                    }
+                } else if (suppressed == 0) {
+                    fprintf(out, "%s", line);
+                }
+                continue;
+            }
+
+            if (directive == CPP_ELIF && cond_depth > 0) {
+                cond_frame *frame = &cond_stack[cond_depth - 1];
+                if (frame->managed) {
+                    if (frame->taken) {
+                        if (frame->emit) {
+                            frame->emit = false;
+                            suppressed ++;
+                        }
+                    } else {
+                        if (!frame->emit) {
+                            suppressed --;
+                        }
+                        frame->emit = true;
+                        frame->managed = false;
+                        if (suppressed == 0) {
+                            fprintf(out, "#if%s", arg);
+                        }
+                    }
+                } else if (suppressed == 0) {
+                    fprintf(out, "%s", line);
+                }
+                continue;
+            }
+
+            if (directive == CPP_ENDIF && cond_depth > 0) {
+                cond_frame *frame = &cond_stack[-- cond_depth];
+                if (frame->managed) {
+                    if (!frame->emit) {
+                        suppressed --;
+                    }
+                } else if (suppressed == 0) {
+                    fprintf(out, "%s", line);
+                }
                 continue;
             }
         }
-        
-        fprintf(out, "%s", line);
+
+        if (suppressed > 0) {
+            continue;
+        }
+
+        /* Drop the enable "#define FLAG" for a disabled flag so the flag is
+         * genuinely undefined for the compiler. */
+        if (has_disable && !line_in_block_comment_at_start &&
+            is_disabled_define(line, disable))
+        {
+            continue;
+        }
+
+        bool relative = false;
+        char *include = NULL;
+        if (!line_in_block_comment_at_start) {
+            include = parse_include_file(line, &relative);
+        }
+
+        if (!include) {
+            fprintf(out, "%s", line);
+            continue;
+        }
+
+        if (!is_include && main_included && !main_included[0]) {
+            /* If this is the first include of the source file, add include
+             * statement for main header */
+            fprintf(out, "#include \"%s.h\"\n", include_name);
+            main_included[0] = true;
+        }
+
+        bool recurse = false;
+        char *path = NULL;
+
+        if (!relative) {
+            /* If this is in the bake_config.h file, replace the statement with
+             * one that uses "". Assume that the file exists, as bake may still
+             * be generating it. */
+            if (bake_config_h) {
+                fprintf(out, "#include \"%s\"\n", include);
+                free(include);
+                continue;
+            }
+
+            /* If this is an absolute path, this either refers to a system
+             * include file or to a file in the include folder. Only amalgamate
+             * when the file is in our include folder. */
+            path = combine_path(include_path, include);
+            if (ut_file_test(path) == 1) {
+                recurse = true;
+            }
+        } else {
+            /* Relative path: search relative to current file, then in the
+             * include path. */
+            path = combine_path(cur_path, include);
+            if (ut_file_test(path) != 1) {
+                free(path);
+                path = combine_path(include_path, include);
+                if (ut_file_test(path) == 1) {
+                    recurse = true;
+                } else {
+                    free(path);
+                    path = NULL;
+                }
+            } else {
+                recurse = true;
+            }
+        }
+
+        if (recurse) {
+            ut_try( amalgamate(include_name, out, include_path, is_include, path,
+                file, line_count, files_parsed, disable, main_included), NULL);
+        } else {
+            fprintf(out, "%s", line);
+        }
+
+        free(path);
+        free(include);
     }
 
     fprintf(out, "\n"); /* Support for empty files */
 
-    ut_file_close(in);
+    fclose(in);
 
     return 0;
+error_close:
+    fclose(in);
 error:
+    free(cur_path);
     return -1;
 }
 
@@ -246,7 +615,7 @@ char *find_main_src_file(
     /* Try project_full_name.cxx */
     if (main_src_file == NULL) {
         main_src_file = ut_asprintf(
-            "%s/%s.%s", src_path, project->id_underscore, 
+            "%s/%s.%s", src_path, project->id_underscore,
             project->language);
     }
     if (ut_file_test(main_src_file) != 1) {
@@ -257,7 +626,7 @@ char *find_main_src_file(
     /* Try name.cxx */
     if (main_src_file == NULL) {
         main_src_file = ut_asprintf(
-            "%s/%s.%s", src_path, project->id_base, 
+            "%s/%s.%s", src_path, project->id_base,
             project->language);
     }
     if (ut_file_test(main_src_file) != 1) {
@@ -269,6 +638,7 @@ char *find_main_src_file(
 }
 
 // Sort file paths by directory depth, then alphabetically
+static
 int file_path_compare(
     const void *ptr1,
     const void *ptr2)
@@ -296,6 +666,331 @@ int file_path_compare(
     return strcmp(path1, path2);
 }
 
+/* -- Output cleanup: drop @file comment blocks, collapse blank line runs -- */
+
+static
+bool comment_has_file_directive(
+    const char *start,
+    const char *end)
+{
+    const char *q;
+    for (q = start; q + 5 <= end; q ++) {
+        if ((q[0] == '@' || q[0] == '\\') &&
+            q[1] == 'f' && q[2] == 'i' && q[3] == 'l' && q[4] == 'e')
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static
+char* clean_amalgamation(
+    const char *in,
+    size_t in_len)
+{
+    char *out = malloc(in_len + 1);
+    if (!out) {
+        return NULL;
+    }
+
+    size_t w = 0;
+    int newline_run = 2;
+    const char *p = in;
+    const char *in_end = in + in_len;
+
+    while (*p) {
+        char c = *p;
+
+        if (c == '"' || c == '\'') {
+            char quote = c;
+            out[w ++] = *p ++;
+            while (*p) {
+                if (*p == '\\' && p[1]) {
+                    out[w ++] = *p ++;
+                    out[w ++] = *p ++;
+                    continue;
+                }
+                char s = *p;
+                out[w ++] = *p ++;
+                if (s == quote) {
+                    break;
+                }
+            }
+            newline_run = 0;
+            continue;
+        }
+
+        if (c == '/' && p[1] == '/') {
+            while (*p && *p != '\n') {
+                out[w ++] = *p ++;
+            }
+            newline_run = 0;
+            continue;
+        }
+
+        if (c == '/' && p[1] == '*') {
+            const char *end = strstr(p + 2, "*/");
+            const char *comment_end = end ? end + 2 : in_end;
+            if (comment_has_file_directive(p, comment_end)) {
+                p = comment_end;
+                continue;
+            }
+            while (p < comment_end) {
+                out[w ++] = *p ++;
+            }
+            newline_run = 0;
+            continue;
+        }
+
+        if (c == '\n') {
+            if (newline_run >= 2) {
+                p ++;
+                continue;
+            }
+            out[w ++] = '\n';
+            newline_run ++;
+            p ++;
+            continue;
+        }
+
+        out[w ++] = c;
+        newline_run = 0;
+        p ++;
+    }
+
+    out[w] = '\0';
+    return out;
+}
+
+static
+char* read_file(
+    const char *path,
+    size_t *len_out)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n < 0) {
+        fclose(f);
+        return NULL;
+    }
+    char *buf = malloc((size_t)n + 1);
+    size_t rd = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    buf[rd] = '\0';
+    if (len_out) {
+        *len_out = rd;
+    }
+    return buf;
+}
+
+/* Clean tmp file, write to out file only if content changed, remove tmp */
+static
+int finalize_amalgamation(
+    const char *tmp_file,
+    const char *out_file)
+{
+    size_t len = 0;
+    char *raw = read_file(tmp_file, &len);
+    ut_rm(tmp_file);
+    if (!raw) {
+        return -1;
+    }
+
+    char *cleaned = clean_amalgamation(raw, len);
+    free(raw);
+    if (!cleaned) {
+        return -1;
+    }
+
+    size_t cleaned_len = strlen(cleaned);
+    size_t old_len = 0;
+    char *old = read_file(out_file, &old_len);
+    bool unchanged = old && old_len == cleaned_len &&
+        !memcmp(old, cleaned, cleaned_len);
+    free(old);
+
+    if (!unchanged) {
+        FILE *f = fopen(out_file, "wb");
+        if (!f) {
+            free(cleaned);
+            return -1;
+        }
+        fwrite(cleaned, 1, cleaned_len, f);
+        fclose(f);
+    }
+
+    free(cleaned);
+    return 0;
+}
+
+/* Generate a single amalgamation (one entry in the amalgamate config list) */
+static
+int generate_one(
+    bake_project *project_obj,
+    const char *project_id,
+    const char *include_path,
+    const char *src_path,
+    const char *include_file,
+    const char *target_path,
+    bake_amalgamate_config *cfg)
+{
+    int result = -1;
+    ut_ll disable = cfg->disable_flags;
+    const char *output_base =
+        (cfg->prefix && cfg->prefix[0]) ? cfg->prefix : project_id;
+    const char *src_ext = "c";
+    if (project_obj->language &&
+        (!strcmp(project_obj->language, "cpp") ||
+         !strcmp(project_obj->language, "c++")))
+    {
+        src_ext = "cpp";
+    }
+
+    char *output_path;
+    if (cfg->path && cfg->path[0]) {
+        output_path = ut_asprintf("%s" UT_OS_PS "%s", target_path, cfg->path);
+        ut_mkdir(output_path);
+    } else {
+        output_path = ut_strdup(target_path);
+    }
+
+    char *include_file_out = ut_asprintf("%s/%s.h", output_path, output_base);
+    char *include_file_tmp = ut_asprintf("%s/%s.h.tmp", output_path, output_base);
+    char *src_file_out = ut_asprintf("%s/%s.%s", output_path, output_base, src_ext);
+    char *src_file_tmp = ut_asprintf("%s/%s.%s.tmp", output_path, output_base, src_ext);
+    char *m_file_out = ut_asprintf("%s/%s_objc.m", output_path, output_base);
+    char *m_file_tmp = ut_asprintf("%s/%s_objc.m.tmp", output_path, output_base);
+
+    ut_rb files_parsed = ut_rb_new(compare_string, NULL);
+
+    /* -- Amalgamate header -- */
+    FILE *include_out = fopen(include_file_tmp, "wb");
+    if (!include_out) {
+        ut_error("cannot open output file '%s'", include_file_tmp);
+        goto error;
+    }
+
+    fprintf(include_out, "// Comment out this line when using as DLL\n");
+    fprintf(include_out, "#define %s_STATIC\n", project_id);
+    ut_try( amalgamate(output_base, include_out, include_path, true,
+        include_file, "(main header)", 0, files_parsed, disable, NULL),
+        NULL);
+    fclose(include_out);
+
+    /* -- Amalgamate source -- */
+    FILE *src_out = fopen(src_file_tmp, "wb");
+    if (!src_out) {
+        ut_error("cannot open output file '%s'", src_file_tmp);
+        goto error;
+    }
+
+    bool main_included = false;
+
+    char *main_src_file = find_main_src_file(project_obj, src_path);
+    if (main_src_file) {
+        ut_try( amalgamate(output_base, src_out, include_path, false,
+            main_src_file, "(main source)", 0, files_parsed, disable,
+            &main_included), NULL);
+    }
+
+    /* Recursively iterate sources and store the paths */
+    ut_ll source_files = ut_ll_new();
+    ut_iter it;
+    ut_try( ut_dir_iter(src_path, "//*.c,*.cpp", &it), NULL);
+    while (ut_iter_hasNext(&it)) {
+        char *file = ut_iter_next(&it);
+        char *file_path = combine_path(src_path, file);
+        ut_ll_append(source_files, file_path);
+    }
+
+    uint32_t count = ut_ll_count(source_files);
+    char **buffer = malloc(sizeof(char*) * (count ? count : 1));
+    uint32_t i = 0, x;
+    it = ut_ll_iter(source_files);
+    while (ut_iter_hasNext(&it)) {
+        buffer[i ++] = ut_iter_next(&it);
+    }
+    ut_ll_free(source_files);
+
+    qsort(buffer, i, sizeof(char*), file_path_compare);
+
+    for (x = 0; x < i; x ++) {
+        char *file_path = buffer[x];
+        if (!main_src_file || strcmp(file_path, main_src_file)) {
+            ut_try( amalgamate(output_base, src_out, include_path, false,
+                file_path, "(source)", 0, files_parsed, disable,
+                &main_included), NULL);
+        }
+        free(file_path);
+    }
+    free(buffer);
+
+    if (!main_included) {
+        fprintf(src_out, "#include \"%s.h\"\n", output_base);
+    }
+    fclose(src_out);
+    free(main_src_file);
+
+    /* -- Amalgamate Objective-C sources (only if any exist) -- */
+    FILE *m_out = NULL;
+    ut_rb objc_files_parsed = NULL;
+    bool m_created = false;
+    ut_try( ut_dir_iter(src_path, "//*.m", &it), NULL);
+    while (ut_iter_hasNext(&it)) {
+        char *file = ut_iter_next(&it);
+        char *file_path = combine_path(src_path, file);
+
+        if (!m_out) {
+            m_out = fopen(m_file_tmp, "wb");
+            if (!m_out) {
+                ut_error("cannot open output file '%s'", m_file_tmp);
+                free(file_path);
+                goto error;
+            }
+            objc_files_parsed = ut_rb_new(compare_string, NULL);
+            m_created = true;
+        }
+
+        ut_try( amalgamate(output_base, m_out, include_path, false,
+            file_path, "(obj-C source)", 0, objc_files_parsed, disable,
+            &main_included), NULL);
+
+        free(file_path);
+    }
+    if (m_out) {
+        fclose(m_out);
+    }
+
+    ut_rb_free(files_parsed);
+    if (objc_files_parsed) {
+        ut_rb_free(objc_files_parsed);
+    }
+
+    /* Clean output & write only when content changed */
+    ut_try( finalize_amalgamation(include_file_tmp, include_file_out), NULL);
+    ut_try( finalize_amalgamation(src_file_tmp, src_file_out), NULL);
+    if (m_created) {
+        ut_try( finalize_amalgamation(m_file_tmp, m_file_out), NULL);
+    }
+
+    result = 0;
+error:
+    free(include_file_out);
+    free(include_file_tmp);
+    free(src_file_out);
+    free(src_file_tmp);
+    free(m_file_out);
+    free(m_file_tmp);
+    free(output_path);
+    return result;
+}
+
 static
 void generate(
     bake_driver_api *driver,
@@ -308,11 +1003,7 @@ void generate(
         }
     }
 
-    ut_rb files_parsed = ut_rb_new(compare_string, NULL);
     const char *project = project_obj->id_underscore;
-    char *project_upper = ut_strdup(project_obj->id_underscore);
-    strupper(project_upper);
-
     const char *project_path = project_obj->path;
     if (!project_path) {
         ut_error("cannot find source for project '%s'", project);
@@ -324,185 +1015,56 @@ void generate(
         target_path = project_obj->generate_path;
     }
 
-    char *output_path;
-    if (project_obj->amalgamate_path) {
-        output_path = ut_asprintf("%s/%s", target_path, project_obj->amalgamate_path);
-        ut_mkdir(output_path);
-    } else {
-        output_path = ut_asprintf("%s", target_path);
-    }
-
-    /* Create output file strings & check when they were last modified */
-    char *include_file_out = ut_asprintf("%s/%s.h", output_path, project);
-    char *include_file_tmp = ut_asprintf("%s/%s.h.tmp", output_path, project);
-    time_t include_modified = 0;
-    if (ut_file_test(include_file_out) == 1) {
-        include_modified = ut_lastmodified(include_file_out);
-    }
-
-    char *src_file_out = ut_asprintf("%s/%s.c", output_path, project);
-    char *src_file_tmp = ut_asprintf("%s/%s.c.tmp", output_path, project);
-    time_t src_modified = 0;
-    if (ut_file_test(src_file_out) == 1) {
-        src_modified = ut_lastmodified(src_file_out);
-    }
-
-    /* In case project contains Objective C files */
-    char *m_file_out = ut_asprintf("%s/%s_objc.m", output_path, project);
-    char *m_file_tmp = ut_asprintf("%s/%s_objc.m.tmp", output_path, project);
-    time_t m_modified = 0;
-    if (ut_file_test(m_file_out) == 1) {
-        m_modified = ut_lastmodified(m_file_out);
-    }
-
-    time_t project_modified = 0;
-
-    /* -- Amalgamate include files -- */
     char *include_path = combine_path(project_path, "include");
+    char *src_path = combine_path(project_path, "src");
     char *include_file = ut_asprintf("%s/%s.h", include_path, project);
 
     if (ut_file_test(include_file) != 1) {
         ut_error("cannot find include file '%s'", include_file);
-        goto error;
+        goto error_free;
     }
 
-    /* Create amalgamated header file */
-    FILE *include_out = fopen(include_file_tmp, "wb");
-    if (!include_out) {
-        ut_error("cannot open output file '%s'", include_file_out);
-        goto error;
+    /* Use the configured amalgamation list, or synthesize a single config from
+     * the legacy amalgamate-path setting (also used when copying amalgamated
+     * sources from dependencies). */
+    ut_ll configs = project_obj->amalgamate_configs;
+    ut_ll synth_list = NULL;
+    bake_amalgamate_config synth;
+    if (!configs || !ut_ll_count(configs)) {
+        synth.path = project_obj->amalgamate_path;
+        synth.prefix = NULL;
+        synth.disable_flags = NULL;
+        synth_list = ut_ll_new();
+        ut_ll_append(synth_list, &synth);
+        configs = synth_list;
     }
 
-    /* If file is embedded, the code should behave like a static library */
-    fprintf(include_out, "// Comment out this line when using as DLL\n");
-    fprintf(include_out, "#define %s_STATIC\n", project_obj->id_underscore);
-    ut_try(amalgamate(project, include_out, include_path, true, include_file, 
-        "(main header)", 0, files_parsed, &project_modified, 0), NULL);
-    fclose(include_out);
-
-    /* -- Amalgamate source files -- */
-    char *src_path = combine_path(project_path, "src");
-
-    /* Create amalgamated source file */
-    FILE *src_out = fopen(src_file_tmp, "wb");
-    if (!src_out) {
-        ut_error("cannot open output file '%s'", include_file_out);
-        goto error;
-    }
-
-    /* The main header is included in place of the first #include statement
-     * found. This keeps any macro's defined before including a file intact */
-    bool main_included = false;
-
-    /* Try to find a file with the name "main.lang" or the name of the project.
-     * If a project contains a file with that name, process it first. This gives
-     * the project an opportunity to control how headers are included by its own
-     * files, as each header is only appended once. */
-    char *main_src_file = find_main_src_file(project_obj, src_path);
-    if (main_src_file) {
-        ut_try(amalgamate(project, src_out, include_path, false, main_src_file, 
-            "(main source)", 0, files_parsed, &project_modified, 
-            &main_included), NULL);
-    }
-
-    /* Recursively iterate sources and store the paths */
-    ut_ll source_files = ut_ll_new();
-    ut_iter it;
-    ut_try(ut_dir_iter(src_path, "//*.c,*.cpp", &it), NULL);
+    ut_iter it = ut_ll_iter(configs);
     while (ut_iter_hasNext(&it)) {
-        char *file = ut_iter_next(&it);
-        char *file_path = combine_path(src_path, file);
-        ut_ll_append(source_files, file_path);
-    }
-
-    /* Copy file paths to array so they can be sorted with qsort */
-    char **buffer = malloc(sizeof(char*) * ut_ll_count(source_files));
-    uint32_t i = 0, x;
-    it = ut_ll_iter(source_files);
-    while (ut_iter_hasNext(&it)) {
-        buffer[i ++] = ut_iter_next(&it);
-    }
-    ut_ll_free(source_files);
-
-    /* Sort the source file list to ensure consistent output order */
-    qsort(buffer, i, sizeof(char*), file_path_compare);
-
-    /* Iterate paths and append to source file */
-    for (x = 0; x < i; x++) {
-        char *file_path = buffer[x];
-
-        if (!main_src_file || strcmp(file_path, main_src_file)) {
-            ut_try(amalgamate(project, src_out, include_path, false, file_path, 
-                "(main source)", 0, files_parsed, &project_modified, 
-                &main_included), NULL);
-        }
-
-        free(file_path);
-    }
-    free(buffer);
-
-    fclose(src_out);
-    free(main_src_file);
-
-    /* Objective C output is only created when necessary */
-    FILE *m_out = NULL;
-
-    /* Start with fresh parsed files list */
-    ut_rb objc_files_parsed = NULL;
-
-    /* Recursively iterate objective-C sources, append to source file */
-    ut_try(ut_dir_iter(src_path, "//*.m", &it), NULL);
-    while (ut_iter_hasNext(&it)) {
-        char *file = ut_iter_next(&it);
-        char *file_path = combine_path(src_path, file);
-
-        if (!m_out) {
-            m_out = fopen(m_file_tmp, "wb");
-            if (!m_out) {
-                ut_error("cannot open output file '%s'", m_file_tmp);
-                goto error;
+        bake_amalgamate_config *cfg = ut_iter_next(&it);
+        if (generate_one(project_obj, project, include_path, src_path,
+            include_file, target_path, cfg))
+        {
+            if (synth_list) {
+                ut_ll_free(synth_list);
             }
-
-            objc_files_parsed = ut_rb_new(compare_string, NULL);
+            goto error_free;
         }
-
-        ut_try(amalgamate(project, m_out, include_path, false, file_path, 
-            "(main obj-C source)", 0, objc_files_parsed, &project_modified, 
-            &main_included), NULL);
-    }
-    if (m_out) {
-        fclose(m_out);
     }
 
-    /* Timestamps were checked while amalgamating. Only replace files with new
-     * result if we found that inputs were newer. This ensures we won't end up
-     * rebuilding amalgamated file on every build. */
-    if (project_modified > src_modified || project_modified > include_modified){
-        ut_rename(src_file_tmp, src_file_out);
-        ut_rename(include_file_tmp, include_file_out);
-    } else {
-        ut_rm(src_file_tmp);
-        ut_rm(include_file_tmp);
+    if (synth_list) {
+        ut_ll_free(synth_list);
     }
 
-    if (m_out && project_modified > m_modified) {
-        ut_rename(m_file_tmp, m_file_out);
-    } else {
-        ut_rm(m_file_tmp);
-    }
-
-    free(include_file_out);
-    free(include_file_tmp);
-    free(src_file_out);
-    free(src_file_tmp);
-    free(src_path);
     free(include_path);
-    free(output_path);
-
-    ut_rb_free(files_parsed);
-    ut_rb_free(objc_files_parsed);
+    free(src_path);
+    free(include_file);
 
     return;
+error_free:
+    free(include_path);
+    free(src_path);
+    free(include_file);
 error:
     project_obj->error = true;
 }

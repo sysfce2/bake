@@ -352,6 +352,81 @@ int16_t bake_validate_dep_array(
     return 0;
 }
 
+/* Parse a single object in the "amalgamate" array */
+static
+int16_t bake_project_parse_amalgamate_item(
+    bake_project *p,
+    JSON_Object *o)
+{
+    bake_amalgamate_config *cfg = ut_calloc(sizeof(bake_amalgamate_config));
+
+    uint32_t i, count = json_object_get_count(o);
+    for (i = 0; i < count; i ++) {
+        char *member = (char*)json_object_get_name(o, i);
+        JSON_Value *v = json_object_get_value_at(o, i);
+
+        if (!strcmp(member, "path")) {
+            ut_try (bake_json_set_string(&cfg->path, member, v), NULL);
+        } else
+        if (!strcmp(member, "prefix")) {
+            ut_try (bake_json_set_string(&cfg->prefix, member, v), NULL);
+        } else
+        if (!strcmp(member, "disable-flags") || !strcmp(member, "disable_flags")) {
+            ut_try (bake_json_set_array(&cfg->disable_flags, member, v), NULL);
+        } else {
+            ut_throw("unknown member '%s' in amalgamate configuration", member);
+            goto error;
+        }
+    }
+
+    ut_ll_append(p->amalgamate_configs, cfg);
+
+    return 0;
+error:
+    free(cfg);
+    return -1;
+}
+
+/* Parse the "amalgamate" member, which is either a boolean (legacy format) or
+ * an array of configuration objects (new format). */
+static
+int16_t bake_project_parse_amalgamate(
+    bake_project *p,
+    const char *member,
+    JSON_Value *v)
+{
+    JSON_Value_Type type = json_value_get_type(v);
+
+    if (type == JSONBoolean) {
+        ut_try (bake_json_set_boolean(&p->amalgamate, member, v), NULL);
+        return 0;
+    }
+
+    if (type == JSONArray) {
+        p->amalgamate = true;
+        if (!p->amalgamate_configs) {
+            p->amalgamate_configs = ut_ll_new();
+        }
+
+        JSON_Array *array = json_value_get_array(v);
+        uint32_t i, count = json_array_get_count(array);
+        for (i = 0; i < count; i ++) {
+            JSON_Object *o = json_array_get_object(array, i);
+            if (!o) {
+                ut_throw("each 'amalgamate' array element must be an object");
+                goto error;
+            }
+            ut_try (bake_project_parse_amalgamate_item(p, o), NULL);
+        }
+
+        return 0;
+    }
+
+    ut_throw("expected boolean or array for member 'amalgamate'");
+error:
+    return -1;
+}
+
 /* Parse JSON bake attributes in "value" member */
 static
 int16_t bake_project_parse_value(
@@ -374,7 +449,7 @@ int16_t bake_project_parse_value(
            ut_try (bake_json_set_boolean(&p->coverage, member, v), NULL);
         } else   
         if (!strcmp(member, "amalgamate")) {
-           ut_try (bake_json_set_boolean(&p->amalgamate, member, v), NULL);
+           ut_try (bake_project_parse_amalgamate(p, member, v), NULL);
         } else
         if (!strcmp(member, "amalgamate_path") || !strcmp(member, "amalgamate-path")) {
            ut_try (bake_json_set_string(&p->amalgamate_path, member, v), NULL);
@@ -1373,8 +1448,24 @@ int16_t copy_amalgamated_from_dep(
 
         ut_log_push("copy-amalgamate");
 
-        // when amalgamating dependencies, copy them directly into deps/
+        // when amalgamating dependencies, copy the canonical output directly
+        // into deps/ (no subdirectory, no prefixed variants)
         dep->amalgamate_path = NULL;
+        if (dep->amalgamate_configs) {
+            ut_ll filtered = ut_ll_new();
+            ut_iter cfg_it = ut_ll_iter(dep->amalgamate_configs);
+            while (ut_iter_hasNext(&cfg_it)) {
+                bake_amalgamate_config *cfg = ut_iter_next(&cfg_it);
+                if (cfg->prefix && cfg->prefix[0]) {
+                    continue;
+                }
+                free(cfg->path);
+                cfg->path = NULL;
+                ut_ll_append(filtered, cfg);
+            }
+            ut_ll_free(dep->amalgamate_configs);
+            dep->amalgamate_configs = filtered;
+        }
 
         ut_try( bake_driver__generate(amalg_driver, config, dep), NULL);
         ut_log_pop();

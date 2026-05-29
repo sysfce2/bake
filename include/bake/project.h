@@ -74,6 +74,13 @@ typedef struct bake_project_bundle {
     ut_rb refs;
 } bake_project_bundle;
 
+/* A single amalgamation configuration (new "amalgamate" array format) */
+typedef struct bake_amalgamate_config {
+    char *path;             /* Output subdirectory (NULL = project/generate path) */
+    char *prefix;           /* Output base name (NULL = project id) */
+    ut_ll disable_flags;    /* Macro names to treat as undefined (list of char*) */
+} bake_amalgamate_config;
+
 struct bake_project {
     /* Project properties (managed by bake core) */
     char *path;             /* Project path */
@@ -157,6 +164,11 @@ struct bake_project {
     /* Files to be cleaned other than objects and artefact (populated by
      * language binding) */
     ut_ll files_to_clean;
+
+    /* Amalgamation configurations (new "amalgamate" array format). Appended at
+     * the end of the struct to keep the ABI stable for drivers compiled against
+     * an older version of this header. */
+    ut_ll amalgamate_configs;
 };
 
 #ifdef __cplusplus
