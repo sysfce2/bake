@@ -328,6 +328,32 @@ bool cond_eval_managed(
     return false;
 }
 
+/* Records a verbatim (non-inlined) include and reports whether it should be
+ * emitted. Duplicate includes are dropped only at the top level of a
+ * translation unit (if_depth 0); includes guarded by #if are always kept since
+ * the guard may select between alternatives. emitted is NULL for outputs that
+ * are not deduplicated (e.g. the amalgamated header). */
+static
+bool mark_verbatim_include(
+    ut_rb emitted,
+    int32_t if_depth,
+    const char *include,
+    bool relative)
+{
+    if (!emitted || if_depth != 0) {
+        return true;
+    }
+
+    char *key = ut_asprintf("%c%s", relative ? '"' : '<', include);
+    if (ut_rb_find(emitted, key)) {
+        free(key);
+        return false;
+    }
+
+    ut_rb_set(emitted, key, key);
+    return true;
+}
+
 /* Amalgamate source file */
 static
 int amalgamate(
@@ -340,7 +366,9 @@ int amalgamate(
     int32_t src_line,
     ut_rb files_parsed,
     ut_ll disable,
-    bool *main_included)
+    bool *main_included,
+    ut_rb emitted_includes,
+    int32_t if_depth_in)
 {
     char *file = strreplace(const_file, "/", UT_OS_PS);
     ut_path_clean(file, file);
@@ -386,6 +414,7 @@ int amalgamate(
     cond_frame cond_stack[MAX_COND];
     int32_t cond_depth = 0;
     int32_t suppressed = 0;
+    int32_t if_depth = if_depth_in;
 
     while (fgets(line, MAX_LINE_LENGTH, in) != NULL) {
         line_count ++;
@@ -411,6 +440,22 @@ int amalgamate(
                 continue;
             }
             scan ++;
+        }
+
+        /* Track preprocessor conditional nesting so verbatim includes can be
+         * deduplicated only when they sit at the top level of the unit. */
+        if (!line_in_block_comment_at_start) {
+            const char *depth_arg = NULL;
+            cpp_directive_kind depth_dir =
+                parse_cpp_directive(line, &depth_arg);
+            if (depth_dir == CPP_IF ||
+                depth_dir == CPP_IFDEF ||
+                depth_dir == CPP_IFNDEF)
+            {
+                if_depth ++;
+            } else if (depth_dir == CPP_ENDIF && if_depth > 0) {
+                if_depth --;
+            }
         }
 
         /* Handle conditional directives for disabled flags */
@@ -577,8 +622,11 @@ int amalgamate(
 
         if (recurse) {
             ut_try( amalgamate(include_name, out, include_path, is_include, path,
-                file, line_count, files_parsed, disable, main_included), NULL);
-        } else {
+                file, line_count, files_parsed, disable, main_included,
+                emitted_includes, if_depth), NULL);
+        } else if (mark_verbatim_include(
+            emitted_includes, if_depth, include, relative))
+        {
             fprintf(out, "%s", line);
         }
 
@@ -868,6 +916,8 @@ int generate_one(
     char *m_file_tmp = ut_asprintf("%s/%s_objc.m.tmp", output_path, output_base);
 
     ut_rb files_parsed = ut_rb_new(compare_string, NULL);
+    ut_rb emitted = ut_rb_new(compare_string, NULL);
+    ut_rb objc_emitted = NULL;
 
     /* -- Amalgamate header -- */
     FILE *include_out = fopen(include_file_tmp, "wb");
@@ -879,8 +929,8 @@ int generate_one(
     fprintf(include_out, "// Comment out this line when using as DLL\n");
     fprintf(include_out, "#define %s_STATIC\n", project_id);
     ut_try( amalgamate(output_base, include_out, include_path, true,
-        include_file, "(main header)", 0, files_parsed, disable, NULL),
-        NULL);
+        include_file, "(main header)", 0, files_parsed, disable, NULL,
+        NULL, 0), NULL);
     fclose(include_out);
 
     /* -- Amalgamate source -- */
@@ -896,7 +946,7 @@ int generate_one(
     if (main_src_file) {
         ut_try( amalgamate(output_base, src_out, include_path, false,
             main_src_file, "(main source)", 0, files_parsed, disable,
-            &main_included), NULL);
+            &main_included, emitted, 0), NULL);
     }
 
     /* Recursively iterate sources and store the paths */
@@ -925,7 +975,7 @@ int generate_one(
         if (!main_src_file || strcmp(file_path, main_src_file)) {
             ut_try( amalgamate(output_base, src_out, include_path, false,
                 file_path, "(source)", 0, files_parsed, disable,
-                &main_included), NULL);
+                &main_included, emitted, 0), NULL);
         }
         free(file_path);
     }
@@ -954,12 +1004,13 @@ int generate_one(
                 goto error;
             }
             objc_files_parsed = ut_rb_new(compare_string, NULL);
+            objc_emitted = ut_rb_new(compare_string, NULL);
             m_created = true;
         }
 
         ut_try( amalgamate(output_base, m_out, include_path, false,
             file_path, "(obj-C source)", 0, objc_files_parsed, disable,
-            &main_included), NULL);
+            &main_included, objc_emitted, 0), NULL);
 
         free(file_path);
     }
@@ -968,8 +1019,12 @@ int generate_one(
     }
 
     ut_rb_free(files_parsed);
+    ut_rb_free(emitted);
     if (objc_files_parsed) {
         ut_rb_free(objc_files_parsed);
+    }
+    if (objc_emitted) {
+        ut_rb_free(objc_emitted);
     }
 
     /* Clean output & write only when content changed */
